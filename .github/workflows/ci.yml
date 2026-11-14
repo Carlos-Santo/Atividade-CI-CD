@@ -1,0 +1,156 @@
+name: CI - API de Tarefas
+
+# ---------- GATILHO: PULL REQUEST ----------
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+concurrency: # cancela a execução antiga do mesmo PR quando chega um commit novo
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions: # menor privilégio
+  contents: read
+  packages: write
+
+env:
+  NODE_VERSION: '22'
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------- 1) ANÁLISE ESTÁTICA DE CÓDIGO E FORMATAÇÃO ----------
+  lint:
+    name: 1. Análise estática e formatação
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: 'npm' }
+      - run: npm ci
+      - name: Formatação (Prettier)
+        run: npm run format:check
+      - name: Análise estática (ESLint + eslint-plugin-security)
+        run: npm run lint
+      - name: Checagem de tipos (tsc --noEmit)
+        run: npm run typecheck
+
+  # ---------- 2) ANÁLISE ESTÁTICA DE SEGURANÇA (SAST + dependências) ----------
+  security:
+    name: 2. Análise estática de segurança
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: 'npm' }
+      - name: Vulnerabilidades em dependências (npm audit)
+        run: npm audit --audit-level=high
+      - name: SAST no código-fonte (Semgrep)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" -w /src semgrep/semgrep:latest \
+            semgrep scan \
+              --config p/javascript --config p/typescript --config p/nodejs --config p/secrets \
+              --error --metrics=off \
+              --sarif-output=semgrep.sarif --text
+      - name: Guardar relatório do Semgrep
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: semgrep-report, path: semgrep.sarif, if-no-files-found: ignore }
+
+  # ---------- 3) BUILD ----------
+  build:
+    name: 3. Build
+    runs-on: ubuntu-latest
+    needs: [lint, security]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: 'npm' }
+      - run: npm ci
+      - name: Compilar TypeScript
+        run: npm run build
+      - uses: actions/upload-artifact@v4
+        with: { name: dist, path: dist/ }
+
+  # ---------- 4) TESTES UNITÁRIOS E DE INTEGRAÇÃO ----------
+  test:
+    name: 4. Testes unitários e de integração
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: app_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U app"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+    env:
+      DATABASE_URL: postgresql://app:app@localhost:5432/app_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '${{ env.NODE_VERSION }}', cache: 'npm' }
+      - run: npm ci
+      - uses: actions/download-artifact@v4
+        with: { name: dist, path: dist/ }
+      - name: Testes unitários (com mocks + cobertura)
+        run: npm run test:unit
+      - name: Testes de integração (API + PostgreSQL real)
+        run: npm run test:integration
+      - name: Smoke test do build (sobe dist/server.js e chama /health)
+        run: |
+          PORT=3000 node dist/server.js &
+          for _ in $(seq 1 20); do
+            curl -fsS http://localhost:3000/health && exit 0
+            sleep 1
+          done
+          echo "A API não respondeu" && exit 1
+      - name: Guardar relatório de cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: coverage, path: coverage/, if-no-files-found: ignore }
+
+  # ---------- 5) CRIAÇÃO DA IMAGEM DOCKER ----------
+  docker:
+    name: 5. Criação da imagem Docker
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Nome da imagem em minúsculas (exigência do registry)
+        run: echo "IMAGE_NAME=${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=pr
+            type=sha
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Resumo
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### Imagem publicada no GHCR"
+            echo '```'
+            echo "$TAGS"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
